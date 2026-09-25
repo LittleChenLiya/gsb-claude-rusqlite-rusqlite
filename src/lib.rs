@@ -112,6 +112,8 @@ pub use rusqlite_macros::__bind;
 #[macro_use]
 mod error;
 
+#[cfg(feature = "hooks")]
+pub mod authorizer;
 #[cfg(not(feature = "loadable_extension"))]
 pub mod auto_extension;
 #[cfg(feature = "backup")]

@@ -3,6 +3,7 @@
 use crate::raw_statement::RawStatement;
 use crate::{Connection, PrepFlags, Result, Statement};
 use hashlink::LruCache;
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
@@ -58,7 +59,14 @@ impl Connection {
 
 /// Prepared statements LRU cache.
 #[derive(Debug)]
-pub struct StatementCache(RefCell<LruCache<Arc<str>, RawStatement>>);
+pub struct StatementCache {
+    cache: RefCell<LruCache<Arc<str>, RawStatement>>,
+    // Bumped every time the cache is flushed. Statements that were checked
+    // out before a flush are discarded (rather than returned to the cache)
+    // when they are dropped, so they cannot smuggle a stale authorization
+    // context back into the cache.
+    generation: Cell<u64>,
+}
 
 unsafe impl Send for StatementCache {}
 
@@ -70,6 +78,7 @@ unsafe impl Send for StatementCache {}
 pub struct CachedStatement<'conn> {
     stmt: Option<Statement<'conn>>,
     cache: &'conn StatementCache,
+    generation: u64,
 }
 
 impl<'conn> Deref for CachedStatement<'conn> {
@@ -92,17 +101,23 @@ impl Drop for CachedStatement<'_> {
     #[inline]
     fn drop(&mut self) {
         if let Some(stmt) = self.stmt.take() {
-            self.cache.cache_stmt(unsafe { stmt.into_raw() });
+            self.cache
+                .cache_stmt(unsafe { stmt.into_raw() }, self.generation);
         }
     }
 }
 
 impl CachedStatement<'_> {
     #[inline]
-    fn new<'conn>(stmt: Statement<'conn>, cache: &'conn StatementCache) -> CachedStatement<'conn> {
+    fn new<'conn>(
+        stmt: Statement<'conn>,
+        cache: &'conn StatementCache,
+        generation: u64,
+    ) -> CachedStatement<'conn> {
         CachedStatement {
             stmt: Some(stmt),
             cache,
+            generation,
         }
     }
 
@@ -118,12 +133,15 @@ impl StatementCache {
     /// Create a statement cache.
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self(RefCell::new(LruCache::new(capacity)))
+        Self {
+            cache: RefCell::new(LruCache::new(capacity)),
+            generation: Cell::new(0),
+        }
     }
 
     #[inline]
     fn set_capacity(&self, capacity: usize) {
-        self.0.borrow_mut().set_capacity(capacity);
+        self.cache.borrow_mut().set_capacity(capacity);
     }
 
     // Search the cache for a prepared-statement object that implements `sql`.
@@ -139,23 +157,30 @@ impl StatementCache {
         sql: &str,
     ) -> Result<CachedStatement<'conn>> {
         let trimmed = sql.trim();
-        let mut cache = self.0.borrow_mut();
+        let generation = self.generation.get();
+        let mut cache = self.cache.borrow_mut();
         let stmt = match cache.remove(trimmed) {
             Some(raw_stmt) => Ok(Statement::new(conn, raw_stmt)),
             None => conn.prepare_with_flags(trimmed, PrepFlags::SQLITE_PREPARE_PERSISTENT),
         };
         stmt.map(|mut stmt| {
             stmt.stmt.set_statement_cache_key(trimmed);
-            CachedStatement::new(stmt, self)
+            CachedStatement::new(stmt, self, generation)
         })
     }
 
     // Return a statement to the cache.
-    fn cache_stmt(&self, mut stmt: RawStatement) {
+    fn cache_stmt(&self, mut stmt: RawStatement, generation: u64) {
         if stmt.is_null() {
             return;
         }
-        let mut cache = self.0.borrow_mut();
+        if generation != self.generation.get() {
+            // The cache was flushed (e.g. an authorizer scope was entered or
+            // exited) while this statement was checked out: discard it so it
+            // gets re-prepared under the current authorization context.
+            return;
+        }
+        let mut cache = self.cache.borrow_mut();
         stmt.clear_bindings();
         if let Some(sql) = stmt.statement_cache_key() {
             cache.insert(sql, stmt);
@@ -169,7 +194,8 @@ impl StatementCache {
 
     #[inline]
     fn flush(&self) {
-        let mut cache = self.0.borrow_mut();
+        self.generation.set(self.generation.get() + 1);
+        let mut cache = self.cache.borrow_mut();
         cache.clear();
     }
 }
@@ -185,15 +211,15 @@ mod test {
 
     impl StatementCache {
         fn clear(&self) {
-            self.0.borrow_mut().clear();
+            self.cache.borrow_mut().clear();
         }
 
         fn len(&self) -> usize {
-            self.0.borrow().len()
+            self.cache.borrow().len()
         }
 
         fn capacity(&self) -> usize {
-            self.0.borrow().capacity()
+            self.cache.borrow().capacity()
         }
     }
 

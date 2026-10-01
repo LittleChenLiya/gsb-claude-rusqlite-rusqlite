@@ -57,8 +57,13 @@ impl Connection {
 }
 
 /// Prepared statements LRU cache.
+///
+/// Each entry is tagged with the connection's authorizer generation at
+/// prepare time: SQLite only runs the authorizer while preparing a
+/// statement, so an entry prepared under a different authorizer must never
+/// be reused (it would bypass the current authorizer).
 #[derive(Debug)]
-pub struct StatementCache(RefCell<LruCache<Arc<str>, RawStatement>>);
+pub struct StatementCache(RefCell<LruCache<Arc<str>, (u64, RawStatement)>>);
 
 unsafe impl Send for StatementCache {}
 
@@ -70,6 +75,7 @@ unsafe impl Send for StatementCache {}
 pub struct CachedStatement<'conn> {
     stmt: Option<Statement<'conn>>,
     cache: &'conn StatementCache,
+    generation: u64,
 }
 
 impl<'conn> Deref for CachedStatement<'conn> {
@@ -92,7 +98,8 @@ impl Drop for CachedStatement<'_> {
     #[inline]
     fn drop(&mut self) {
         if let Some(stmt) = self.stmt.take() {
-            self.cache.cache_stmt(unsafe { stmt.into_raw() });
+            self.cache
+                .cache_stmt(self.generation, unsafe { stmt.into_raw() });
         }
     }
 }
@@ -100,9 +107,11 @@ impl Drop for CachedStatement<'_> {
 impl CachedStatement<'_> {
     #[inline]
     fn new<'conn>(stmt: Statement<'conn>, cache: &'conn StatementCache) -> CachedStatement<'conn> {
+        let generation = stmt.conn.authorizer_generation();
         CachedStatement {
             stmt: Some(stmt),
             cache,
+            generation,
         }
     }
 
@@ -140,9 +149,15 @@ impl StatementCache {
     ) -> Result<CachedStatement<'conn>> {
         let trimmed = sql.trim();
         let mut cache = self.0.borrow_mut();
+        let generation = conn.authorizer_generation();
         let stmt = match cache.remove(trimmed) {
-            Some(raw_stmt) => Ok(Statement::new(conn, raw_stmt)),
-            None => conn.prepare_with_flags(trimmed, PrepFlags::SQLITE_PREPARE_PERSISTENT),
+            // Only reuse a statement prepared under the current authorizer
+            // generation; anything else was never checked by the current
+            // authorizer, so it is discarded and prepared anew.
+            Some((cached_generation, raw_stmt)) if cached_generation == generation => {
+                Ok(Statement::new(conn, raw_stmt))
+            }
+            _ => conn.prepare_with_flags(trimmed, PrepFlags::SQLITE_PREPARE_PERSISTENT),
         };
         stmt.map(|mut stmt| {
             stmt.stmt.set_statement_cache_key(trimmed);
@@ -151,14 +166,14 @@ impl StatementCache {
     }
 
     // Return a statement to the cache.
-    fn cache_stmt(&self, mut stmt: RawStatement) {
+    fn cache_stmt(&self, generation: u64, mut stmt: RawStatement) {
         if stmt.is_null() {
             return;
         }
         let mut cache = self.0.borrow_mut();
         stmt.clear_bindings();
         if let Some(sql) = stmt.statement_cache_key() {
-            cache.insert(sql, stmt);
+            cache.insert(sql, (generation, stmt));
         } else {
             debug_assert!(
                 false,

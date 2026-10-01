@@ -13,6 +13,9 @@ pub use preupdate_hook::*;
 
 #[cfg(feature = "preupdate_hook")]
 mod preupdate_hook;
+mod scope;
+
+pub use scope::{AuthorizerScope, ReadOnlyTables, ScopePolicy};
 
 /// Action Codes
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -335,6 +338,79 @@ impl Authorization {
             Self::Ignore => ffi::SQLITE_IGNORE,
             Self::Deny => ffi::SQLITE_DENY,
         }
+    }
+
+    /// Combine two authorization decisions, keeping the most restrictive
+    /// one (`Deny` > `Ignore` > `Allow`). This is how nested
+    /// `AuthorizerScope`s compute the intersection of their restrictions.
+    pub(crate) fn most_restrictive(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Deny, _) | (_, Self::Deny) => Self::Deny,
+            (Self::Ignore, _) | (_, Self::Ignore) => Self::Ignore,
+            _ => Self::Allow,
+        }
+    }
+}
+
+/// Boxed, type-erased authorizer hook.
+pub(crate) type BoxedAuthorizer = Box<dyn for<'r> FnMut(AuthContext<'r>) -> Authorization + Send>;
+
+/// The stack of authorizer hooks active on a connection: an optional base
+/// hook (registered with `Connection::authorizer`) plus any number of
+/// scoped hooks (pushed by `Connection::authorizer_scope`, popped when the
+/// returned `AuthorizerScope` guard is dropped).
+///
+/// The effective authorization of an action is the most restrictive result
+/// produced by the active hooks, i.e. the intersection of their
+/// restrictions. Every hook sees every action, so hooks may also be used
+/// for auditing.
+#[derive(Default)]
+pub(crate) struct AuthorizerChain {
+    base: Option<BoxedAuthorizer>,
+    scopes: Vec<BoxedAuthorizer>,
+}
+
+impl AuthorizerChain {
+    fn is_empty(&self) -> bool {
+        self.base.is_none() && self.scopes.is_empty()
+    }
+
+    fn authorize(&mut self, ctx: AuthContext<'_>) -> Authorization {
+        self.base
+            .iter_mut()
+            .chain(self.scopes.iter_mut())
+            .map(|hook| hook(ctx))
+            .fold(Authorization::Allow, Authorization::most_restrictive)
+    }
+}
+
+unsafe extern "C" fn authorizer_chain_trampoline(
+    p_arg: *mut c_void,
+    action_code: c_int,
+    param1: *const c_char,
+    param2: *const c_char,
+    db_name: *const c_char,
+    trigger_or_view_name: *const c_char,
+) -> c_int {
+    unsafe {
+        catch_unwind(|| {
+            let action = AuthAction::from_raw(
+                action_code,
+                expect_optional_utf8(param1, "authorizer param 1"),
+                expect_optional_utf8(param2, "authorizer param 2"),
+            );
+            let auth_ctx = AuthContext {
+                action,
+                database_name: expect_optional_utf8(db_name, "database name"),
+                accessor: expect_optional_utf8(
+                    trigger_or_view_name,
+                    "accessor (inner-most trigger or view)",
+                ),
+            };
+            let chain = &mut *p_arg.cast::<AuthorizerChain>();
+            chain.authorize(auth_ctx)
+        })
+        .map_or_else(|_| ffi::SQLITE_ERROR, Authorization::into_raw)
     }
 }
 
@@ -703,50 +779,48 @@ impl InnerConnection {
     ///     Ok(())
     /// }
     /// ```
-    fn authorizer<'c, F>(&'c mut self, authorizer: Option<F>) -> Result<()>
+    fn authorizer<F>(&mut self, authorizer: Option<F>) -> Result<()>
     where
         F: for<'r> FnMut(AuthContext<'r>) -> Authorization + Send + 'static,
     {
-        unsafe extern "C" fn call_boxed_closure<'c, F>(
-            p_arg: *mut c_void,
-            action_code: c_int,
-            param1: *const c_char,
-            param2: *const c_char,
-            db_name: *const c_char,
-            trigger_or_view_name: *const c_char,
-        ) -> c_int
-        where
-            F: FnMut(AuthContext<'c>) -> Authorization + Send + 'static,
-        {
-            unsafe {
-                catch_unwind(|| {
-                    let action = AuthAction::from_raw(
-                        action_code,
-                        expect_optional_utf8(param1, "authorizer param 1"),
-                        expect_optional_utf8(param2, "authorizer param 2"),
-                    );
-                    let auth_ctx = AuthContext {
-                        action,
-                        database_name: expect_optional_utf8(db_name, "database name"),
-                        accessor: expect_optional_utf8(
-                            trigger_or_view_name,
-                            "accessor (inner-most trigger or view)",
-                        ),
-                    };
-                    let boxed_hook: *mut F = p_arg.cast::<F>();
-                    (*boxed_hook)(auth_ctx)
-                })
-                .map_or_else(|_| ffi::SQLITE_ERROR, Authorization::into_raw)
-            }
-        }
+        self.authorizer_chain().base = authorizer.map(|hook| Box::new(hook) as BoxedAuthorizer);
+        self.sync_authorizer_registration()
+    }
 
-        let x_auth = authorizer
-            .as_ref()
-            .map(|_| call_boxed_closure::<'c, F> as _);
-        self.set_clientdata(c"sqlite3_set_authorizer", authorizer, |db, bh| unsafe {
-            ffi::sqlite3_set_authorizer(db, x_auth, bh)
-        })?;
-        Ok(())
+    /// Push a scoped authorizer hook onto the chain. While at least one
+    /// scoped hook is present, an action is only authorized if the base hook
+    /// (if any) and every scoped hook allow it.
+    pub(crate) fn push_scoped_authorizer(&mut self, hook: BoxedAuthorizer) -> Result<()> {
+        self.authorizer_chain().scopes.push(hook);
+        self.sync_authorizer_registration()
+    }
+
+    /// Pop the most recently pushed scoped authorizer hook, restoring the
+    /// previous authorization behavior. Hooks must be popped in LIFO order;
+    /// `AuthorizerScope` guards guarantee this when they are dropped in the
+    /// reverse order of their creation (the usual Rust drop order).
+    pub(crate) fn pop_scoped_authorizer(&mut self) -> Result<()> {
+        if let Some(chain) = self.authorizer_chain.as_mut() {
+            chain.scopes.pop();
+        }
+        self.sync_authorizer_registration()
+    }
+
+    fn authorizer_chain(&mut self) -> &mut AuthorizerChain {
+        self.authorizer_chain.get_or_insert_with(Box::default)
+    }
+
+    /// Register (or unregister) the SQLite authorizer callback so that it
+    /// dispatches to the current `AuthorizerChain`.
+    fn sync_authorizer_registration(&mut self) -> Result<()> {
+        let (x_auth, p_arg) = match self.authorizer_chain.as_mut() {
+            Some(chain) if !chain.is_empty() => (
+                Some(authorizer_chain_trampoline as _),
+                (&raw mut **chain).cast::<c_void>(),
+            ),
+            _ => (None, std::ptr::null_mut()),
+        };
+        self.decode_result(unsafe { ffi::sqlite3_set_authorizer(self.db, x_auth, p_arg) })
     }
 }
 

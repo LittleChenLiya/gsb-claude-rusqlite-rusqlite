@@ -14,6 +14,11 @@ use crate::version_number;
 
 pub struct InnerConnection {
     pub db: *mut ffi::sqlite3,
+    #[cfg(feature = "hooks")]
+    // Authorizer hook stack, invoked through the trampoline registered with
+    // `sqlite3_set_authorizer`. The boxed chain is never replaced once
+    // created, so the pointer handed to SQLite stays valid until `close`.
+    pub(crate) authorizer_chain: Option<Box<crate::hooks::AuthorizerChain>>,
     // It's unsafe to call `sqlite3_close` while another thread is performing
     // a `sqlite3_interrupt`, and vice versa, so we take this mutex during
     // those functions. This protects a copy of the `db` pointer (which is
@@ -32,6 +37,8 @@ impl InnerConnection {
     pub unsafe fn new(db: *mut ffi::sqlite3, owned: bool) -> Self {
         Self {
             db,
+            #[cfg(feature = "hooks")]
+            authorizer_chain: None,
             interrupt_lock: Arc::new(Mutex::new(if owned { db } else { ptr::null_mut() })),
             owned,
         }
@@ -111,6 +118,15 @@ impl InnerConnection {
     pub fn close(&mut self) -> Result<()> {
         if self.db.is_null() {
             return Ok(());
+        }
+        // Detach the authorizer before the chain is dropped: SQLite would
+        // otherwise keep a dangling pointer (e.g. for connections we do not
+        // own and therefore do not close).
+        #[cfg(feature = "hooks")]
+        if self.authorizer_chain.is_some() {
+            unsafe {
+                ffi::sqlite3_set_authorizer(self.db, None, ptr::null_mut());
+            }
         }
         let mut shared_handle = self.interrupt_lock.lock().unwrap();
         assert!(

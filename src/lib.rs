@@ -70,6 +70,8 @@ pub use libsqlite3_sys as ffi;
 ))]
 pub use sqlite_wasm_rs as ffi;
 
+#[cfg(any(feature = "cache", feature = "hooks"))]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::default::Default;
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
@@ -364,6 +366,12 @@ pub struct Connection {
     #[cfg(feature = "cache")]
     cache: StatementCache,
     transaction_behavior: TransactionBehavior,
+    #[cfg(any(feature = "cache", feature = "hooks"))]
+    // Incremented every time the active authorizer changes (scoped
+    // authorizer enter/exit). Cached statements prepared under a different
+    // generation are never reused, because SQLite only runs the authorizer
+    // at prepare time.
+    authorizer_generation: Cell<u64>,
 }
 
 unsafe impl Send for Connection {}
@@ -377,6 +385,27 @@ impl Drop for Connection {
 }
 
 impl Connection {
+    /// The current authorizer generation, bumped whenever the active
+    /// authorizer changes. Used to keep the prepared-statement cache from
+    /// serving statements that were never checked by the current
+    /// authorizer.
+    #[cfg(feature = "cache")]
+    pub(crate) fn authorizer_generation(&self) -> u64 {
+        self.authorizer_generation.get()
+    }
+
+    /// Called whenever the active authorizer changes (scoped authorizer
+    /// enter/exit): SQLite only runs the authorizer while preparing a
+    /// statement, so the statement cache must not serve statements prepared
+    /// under a different authorizer.
+    #[cfg(feature = "hooks")]
+    pub(crate) fn bump_authorizer_generation(&self) {
+        self.authorizer_generation
+            .set(self.authorizer_generation.get().wrapping_add(1));
+        #[cfg(feature = "cache")]
+        self.flush_prepared_statement_cache();
+    }
+
     /// Open a new connection to a SQLite database. If a database does not exist
     /// at the path, one is created.
     ///
@@ -474,6 +503,8 @@ impl Connection {
             #[cfg(feature = "cache")]
             cache: StatementCache::with_capacity(STATEMENT_CACHE_DEFAULT_CAPACITY),
             transaction_behavior: TransactionBehavior::Deferred,
+            #[cfg(any(feature = "cache", feature = "hooks"))]
+            authorizer_generation: Cell::new(0),
         })
     }
 
@@ -500,6 +531,8 @@ impl Connection {
             #[cfg(feature = "cache")]
             cache: StatementCache::with_capacity(STATEMENT_CACHE_DEFAULT_CAPACITY),
             transaction_behavior: TransactionBehavior::Deferred,
+            #[cfg(any(feature = "cache", feature = "hooks"))]
+            authorizer_generation: Cell::new(0),
         })
     }
 
@@ -978,6 +1011,8 @@ impl Connection {
             #[cfg(feature = "cache")]
             cache: StatementCache::with_capacity(STATEMENT_CACHE_DEFAULT_CAPACITY),
             transaction_behavior: TransactionBehavior::Deferred,
+            #[cfg(any(feature = "cache", feature = "hooks"))]
+            authorizer_generation: Cell::new(0),
         })
     }
 
@@ -1029,6 +1064,8 @@ impl Connection {
             #[cfg(feature = "cache")]
             cache: StatementCache::with_capacity(STATEMENT_CACHE_DEFAULT_CAPACITY),
             transaction_behavior: TransactionBehavior::Deferred,
+            #[cfg(any(feature = "cache", feature = "hooks"))]
+            authorizer_generation: Cell::new(0),
         })
     }
 

@@ -102,6 +102,8 @@ pub use crate::row::{AndThenRows, Map, MappedRows, Row, RowIndex, Rows};
 pub use crate::statement::{Statement, StatementStatus};
 pub use crate::transaction::TransactionState;
 pub use crate::transaction::{DropBehavior, Savepoint, Transaction, TransactionBehavior};
+#[cfg(feature = "hooks")]
+pub use crate::txn_collector::{ChangeCollector, ChangeEvent};
 pub use crate::types::ToSql;
 pub use crate::util::Name;
 pub use crate::version::*;
@@ -149,6 +151,8 @@ mod statement;
 #[cfg(feature = "trace")]
 pub mod trace;
 mod transaction;
+#[cfg(feature = "hooks")]
+pub mod txn_collector;
 pub mod types;
 #[cfg(feature = "unlock_notify")]
 mod unlock_notify;

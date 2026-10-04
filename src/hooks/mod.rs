@@ -14,6 +14,9 @@ pub use preupdate_hook::*;
 #[cfg(feature = "preupdate_hook")]
 mod preupdate_hook;
 
+#[cfg(feature = "hooks")]
+pub mod txn_changes;
+
 /// Action Codes
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(i32)]

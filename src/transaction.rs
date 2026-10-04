@@ -356,7 +356,7 @@ impl Savepoint<'_> {
     }
 }
 
-fn cmd(cmd: &'static str, to: bool, name: &str) -> Result<Sql> {
+pub(crate) fn cmd(cmd: &'static str, to: bool, name: &str) -> Result<Sql> {
     let mut sql = Sql::new();
     sql.push_keyword(cmd)?;
     sql.push_space();
